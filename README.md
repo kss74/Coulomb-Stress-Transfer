@@ -26,7 +26,9 @@ without switching tools.
 > [Validation](#validation) — but the code was not hand-written line by
 > line, and the usual caveats about AI-assisted code apply: read it
 > before you rely on it, and please open an issue if something looks
-> off.
+> off. If you want to add more features or debug the plugin, you can
+> ask Claude for help. Just upload the plugin files to a Claude Project
+> or provide the GitHub repository link.
 
 ---
 
