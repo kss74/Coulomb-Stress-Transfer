@@ -120,6 +120,24 @@ use "sources"/"receiver"/"grid" at all:
       # every pair simply lies exactly on the requested rake by
       # construction (a useful sanity check: the report's atan2-derived
       # rake column will exactly reproduce the input value).
+  "auto_sigma": bool,          # optional, default false. Per whole
+      # component group (e/n/u/los -- NOT per point), estimate sigma
+      # from the inversion's own residual RMS via 2-3 solve iterations,
+      # for any group where NOT ONE point was given an explicit sigma.
+      # Groups with even partial explicit sigma coverage are left
+      # untouched. See _solve_with_auto_sigma()/_group_needs_auto_sigma()
+      # docstrings for the full rationale (restricted-maximum-likelihood-
+      # style variance-component estimation -- the standard answer when
+      # true measurement uncertainty is unknown).
+  "estimate_uncertainty": bool,   # optional, default false. See
+      # _solve_slip_inversion()'s docstring: closed-form Bayesian linear
+      # posterior std when target_mw is None, residual bootstrap when
+      # target_mw is set (no closed form for the nonlinear-constrained
+      # case). Computed on the FINAL solve only when combined with
+      # auto_sigma (intermediate sigma-refinement passes skip it).
+  "n_bootstrap": int,          # optional, default 20. Only used for the
+      # bootstrap fallback above (target_mw set AND estimate_uncertainty
+      # true); ignored otherwise.
 }
 
 Output JSON schema (mode="slip_inversion"):
@@ -130,14 +148,28 @@ Output JSON schema (mode="slip_inversion"):
       # length n_length*n_width, same flat i*n_length+j order as "patches".
       # Always this [rt_lateral, reverse] pair shape regardless of
       # whether fixed_rake_deg was used (see input schema note above).
+  "slip_std": [[std_rt_0, std_rev_0], ...] | null,   # same shape as
+      # "slip"; null unless estimate_uncertainty was true.
+  "uncertainty_method": "posterior_linear" | "bootstrap" | null,
+  "n_bootstrap_used": int,     # 0 unless the bootstrap path ran
   "rms_misfit": float, "achieved_mw": float, "n_data": int,
   "predicted": [...], "observed": [...],   # same order, one per used
                                             # component/LOS row, weighted
+  "row_weights": [...],        # same order as predicted/observed; the
+      # 1/sigma weight actually applied to that row (1.0 if unweighted).
+      # Dividing (predicted[k]-observed[k]) by row_weights[k] recovers
+      # the physical-unit residual for that row regardless of whether
+      # the weight came from a user sigma or auto_sigma.
   "component_labels": [[obs_idx, "e"|"n"|"u"|"los"], ...],
       # obs_idx indexes "observations" for e/n/u, "los_observations" for
       # "los" -- matches predicted/observed order
-  "fixed_rake_deg": float | list[float] | null   # echoes the input, for
+  "fixed_rake_deg": float | list[float] | null,  # echoes the input, for
                                                   # report/diagnostic use
+  "estimated_sigma": {"e": float, "n": float, ...} | {},   # only the
+      # groups that were actually auto-estimated (empty {} when
+      # auto_sigma was false or nothing needed it)
+  "sigma_iteration_history": [{"e": float, ...}, ...]   # one entry per
+      # auto-sigma solve iteration, in order; [] when auto_sigma unused
 }
 
 Input/output JSON schema (mode="slip_inversion_group") -- see
@@ -470,11 +502,21 @@ def _run_slip_inversion(dc3dwrapper, job):
         raise ValueError("No observations or los_observations given -- nothing to invert.")
 
     fixed_rake_deg = job.get("fixed_rake_deg", None)
+    auto_sigma = bool(job.get("auto_sigma", False))
+    estimate_uncertainty = bool(job.get("estimate_uncertainty", False))
+    n_bootstrap = int(job.get("n_bootstrap", 20))
     L_base = _laplacian_base(np, [(n_length, n_width)])
+
+    if auto_sigma:
+        return _solve_with_auto_sigma(
+            dc3dwrapper, np, patches, L_base, observations, los_observations,
+            mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
+            estimate_uncertainty, n_bootstrap)
 
     return _solve_slip_inversion(
         dc3dwrapper, np, patches, L_base, observations, los_observations,
-        mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg)
+        mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
+        estimate_uncertainty, n_bootstrap)
 
 
 def _run_slip_inversion_group(dc3dwrapper, job):
@@ -546,6 +588,9 @@ def _run_slip_inversion_group(dc3dwrapper, job):
         raise ValueError("No observations or los_observations given -- nothing to invert.")
 
     fixed_rake_deg = job.get("fixed_rake_deg", None)
+    auto_sigma = bool(job.get("auto_sigma", False))
+    estimate_uncertainty = bool(job.get("estimate_uncertainty", False))
+    n_bootstrap = int(job.get("n_bootstrap", 20))
 
     patches = []
     shapes = []
@@ -568,9 +613,16 @@ def _run_slip_inversion_group(dc3dwrapper, job):
 
     L_base = _laplacian_base(np, shapes)
 
-    result = _solve_slip_inversion(
-        dc3dwrapper, np, patches, L_base, observations, los_observations,
-        mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg)
+    if auto_sigma:
+        result = _solve_with_auto_sigma(
+            dc3dwrapper, np, patches, L_base, observations, los_observations,
+            mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
+            estimate_uncertainty, n_bootstrap)
+    else:
+        result = _solve_slip_inversion(
+            dc3dwrapper, np, patches, L_base, observations, los_observations,
+            mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
+            estimate_uncertainty, n_bootstrap)
     result["segment_patch_counts"] = segment_patch_counts
     return result
 
@@ -611,9 +663,123 @@ def _laplacian_base(np, shapes):
     return L_base
 
 
+def _group_needs_auto_sigma(observations, los_observations):
+    """
+    Per-component-group (e, n, u, los) decision of whether that whole
+    group should get an auto-estimated sigma: True only if the group has
+    at least one used value AND not a single point in it was given an
+    explicit sigma by the caller. A group with even partial explicit
+    sigma coverage is left alone -- auto-estimation applies per whole
+    group, not per individual point, so it never silently overrides a
+    sigma the user actually supplied (see the 2026-09-03 scoping note:
+    "explicit convention over silent guessing" is a standing project
+    principle). Points within an auto-estimated group that still lack a
+    value simply keep the group's one estimated sigma.
+    """
+    status = {}
+    for comp in ("e", "n", "u"):
+        used = [o.get(f"sigma_{comp}") for o in observations if o.get(comp) is not None]
+        status[comp] = (len(used) > 0) and all(v is None for v in used)
+    used_los = [o.get("sigma") for o in los_observations]
+    status["los"] = (len(used_los) > 0) and all(v is None for v in used_los)
+    return status
+
+
+def _solve_with_auto_sigma(dc3dwrapper, np, patches, L_base, observations,
+                           los_observations, mu, nu, smoothing_factor,
+                           max_slip, target_mw, fixed_rake_deg,
+                           estimate_uncertainty, n_bootstrap, n_iters=3):
+    """
+    Iterative empirical-Bayes sigma estimation, applied per whole
+    component group (e/n/u/los -- see _group_needs_auto_sigma()), for
+    groups where the caller supplied no sigma at all. Standard practice
+    when true measurement uncertainty is unknown: use the inversion's
+    own residual RMS for a group as that group's noise estimate, re-
+    solve, repeat until it stabilizes (2-3 iterations is normally
+    enough; this is restricted-maximum-likelihood-style variance-
+    component estimation, not a from-scratch statistical model). Groups
+    with an explicit user-supplied sigma are left untouched throughout.
+
+    Physical (unweighted) residuals are recovered from the solve's
+    weighted "predicted"/"observed"/"row_weights" outputs by dividing
+    back out the weight used for that row (weight = 1/sigma_used, so
+    physical_residual = weighted_residual / weight) -- this works
+    whether the row's weight came from a user sigma (untouched groups)
+    or from the previous iteration's estimate, so it stays correct
+    across iterations without re-deriving anything.
+
+    Runs n_iters full solves; only the LAST one carries estimate_uncertainty/
+    n_bootstrap (those are relatively expensive and only meaningful once
+    sigma has stabilized -- computing them on every intermediate pass
+    would be wasted work).
+    """
+    import copy
+
+    auto_groups = _group_needs_auto_sigma(observations, los_observations)
+    if not any(auto_groups.values()):
+        # Nothing to auto-estimate (every present group already has an
+        # explicit sigma somewhere) -- just run the ordinary solve once.
+        result = _solve_slip_inversion(
+            dc3dwrapper, np, patches, L_base, observations, los_observations,
+            mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
+            estimate_uncertainty, n_bootstrap)
+        result["estimated_sigma"] = {}
+        result["sigma_iteration_history"] = []
+        return result
+
+    obs_work = copy.deepcopy(observations)
+    los_work = copy.deepcopy(los_observations)
+    sigma_history = []
+    result = None
+
+    for it in range(max(1, n_iters)):
+        is_last = (it == n_iters - 1)
+        result = _solve_slip_inversion(
+            dc3dwrapper, np, patches, L_base, obs_work, los_work,
+            mu, nu, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
+            estimate_uncertainty=(estimate_uncertainty and is_last),
+            n_bootstrap=n_bootstrap)
+
+        group_sq_resid = {"e": [], "n": [], "u": [], "los": []}
+        for k, (o_idx, comp) in enumerate(result["component_labels"]):
+            weight = result["row_weights"][k]
+            phys_resid = (result["predicted"][k] - result["observed"][k]) / weight
+            group_sq_resid[comp].append(phys_resid ** 2)
+
+        new_sigma = {}
+        for comp, needs_auto in auto_groups.items():
+            if not needs_auto:
+                continue
+            sq = group_sq_resid.get(comp, [])
+            if sq:
+                rms = math.sqrt(sum(sq) / len(sq))
+                # Floor avoids a degenerate zero/near-zero sigma (e.g. an
+                # exactly-fit single-observation group) driving the next
+                # iteration's weight to infinity.
+                new_sigma[comp] = max(rms, 1e-9)
+        sigma_history.append(new_sigma)
+
+        if is_last:
+            break
+
+        for comp, sval in new_sigma.items():
+            if comp == "los":
+                for o in los_work:
+                    o["sigma"] = sval
+            else:
+                for o in obs_work:
+                    if o.get(comp) is not None:
+                        o[f"sigma_{comp}"] = sval
+
+    result["estimated_sigma"] = sigma_history[-1] if sigma_history else {}
+    result["sigma_iteration_history"] = sigma_history
+    return result
+
+
 def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
                           los_observations, mu, nu, smoothing_factor,
-                          max_slip, target_mw, fixed_rake_deg=None):
+                          max_slip, target_mw, fixed_rake_deg=None,
+                          estimate_uncertainty=False, n_bootstrap=20):
     """
     The shared solve core of _run_slip_inversion()/_run_slip_inversion_group():
     Green's-matrix assembly, bounded/Laplacian-damped (optionally
@@ -633,6 +799,40 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
       SAME full (n_data x 2*n_p) Green's matrix G through P rather than
       rebuilding the Green's functions -- G is linear in the unknowns,
       so G_reduced = G @ P is exact, not an approximation.
+
+    estimate_uncertainty : if True, additionally computes a per-patch
+      1-sigma uncertainty on the recovered (rt_lateral, reverse) slip.
+      Two paths, matching the docstring note from the 2026-09-03
+      Bayesian-uncertainty scoping discussion:
+        - target_mw is None (the ordinary linear, unconstrained-moment
+          case): closed-form Bayesian linear posterior. With Gaussian
+          data noise and a Gaussian roughness prior, the posterior
+          covariance of the unknowns is
+              Cov_x = (G_solve^T G_solve + smoothing_factor^2 * L_solve^T L_solve)^+
+          (pseudo-inverse, since underdetermined geometries -- e.g.
+          vertical-only GNSS or a single InSAR track -- can leave this
+          singular or near-singular). G_solve/L_solve here already have
+          any per-row 1/sigma weighting baked in (see step 2 above), so
+          this is exactly the standard weighted-least-squares-with-prior
+          posterior, no separate noise covariance term needed. This is
+          plain linear algebra on matrices already built for the main
+          solve -- cheap, no extra Green's-function evaluations.
+        - target_mw is not None (moment-equality-constrained, solved via
+          trust-constr): the constraint makes the problem nonlinear, so
+          there is no closed-form posterior. Falls back to a residual
+          bootstrap: resample data rows with replacement n_bootstrap
+          times, re-solve the SAME constrained problem each time (warm-
+          started from the unresampled solution), and take the spread
+          (std) of the recovered slip across resamples. This captures
+          data-noise sensitivity, not full parameter-space exploration --
+          documented as a scoped limitation, not a full MCMC posterior.
+      Output keys added when this is True: "slip_std" (same
+      [n_p][2] shape as "slip"), "uncertainty_method"
+      ("posterior_linear" | "bootstrap"), "n_bootstrap_used" (int, 0 for
+      the closed-form path).
+    n_bootstrap : number of bootstrap resamples for the constrained-case
+      fallback above; ignored when target_mw is None. Kept modest by
+      default (20) since each resample re-runs a trust-constr solve.
     """
     import math
 
@@ -663,7 +863,7 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
     #         Optional per-row 1-sigma weights (1/sigma) let GNSS and
     #         InSAR data with very different noise levels be combined
     #         in one joint solve without one dataset silently dominating.
-    d_rows, G_rows, comp_labels = [], [], []
+    d_rows, G_rows, comp_labels, row_weights = [], [], [], []
     if observations:
         comp_map = {"e": (Ge_rt, Ge_rev), "n": (Gn_rt, Gn_rev), "u": (Gu_rt, Gu_rev)}
         for o_idx, obs in enumerate(observations):
@@ -677,6 +877,7 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
                 G_rows.append(weight * np.concatenate([Grt[o_idx, :], Grev[o_idx, :]]))
                 d_rows.append(weight * float(val))
                 comp_labels.append((o_idx, comp))
+                row_weights.append(weight)
 
     for o_idx, obs in enumerate(los_observations):
         look = np.array([obs["look_e"], obs["look_n"], obs["look_u"]], dtype=float)
@@ -691,6 +892,7 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
         G_rows.append(weight * np.concatenate([row_rt, row_rev]))
         d_rows.append(weight * float(obs["los"]))
         comp_labels.append((o_idx, "los"))
+        row_weights.append(weight)
 
     if not d_rows:
         raise ValueError("No observation components (e/n/u/los) were provided -- nothing to invert.")
@@ -812,23 +1014,38 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
                 f"max_slip={max_slip:.2f} m -- maximum achievable is "
                 f"Mw {max_possible_mw:.2f}.")
 
-        def objective(x):
-            residual = G_solve @ x - d
-            roughness = L_solve @ x if L_solve.shape[0] > 0 else np.zeros(0)
-            return float(residual @ residual + (smoothing_factor**2) * (roughness @ roughness))
+        def _quadratic_pieces(G_mat, d_vec):
+            # Builds the objective/gradient/(constant)Hessian closures for
+            # a GIVEN (G_mat, d_vec) pair rather than closing over G_solve/d
+            # directly, so the exact same machinery can be reused unchanged
+            # for bootstrap resamples below (only G_mat/d_vec differ between
+            # resamples -- L_solve/smoothing_factor/n_unknowns do not).
+            GTG_, GTd_ = G_mat.T @ G_mat, G_mat.T @ d_vec
+            LTL_ = (L_solve.T @ L_solve) if L_solve.shape[0] > 0 else np.zeros((n_unknowns, n_unknowns))
+            lam2_ = smoothing_factor**2
+            H_const_ = 2.0 * (GTG_ + lam2_ * LTL_)
 
-        GTG, GTd = G_solve.T @ G_solve, G_solve.T @ d
-        LTL = (L_solve.T @ L_solve) if L_solve.shape[0] > 0 else np.zeros((n_unknowns, n_unknowns))
-        lam2 = smoothing_factor**2
-        H_const = 2.0 * (GTG + lam2 * LTL)
+            def objective(x):
+                residual = G_mat @ x - d_vec
+                roughness = L_solve @ x if L_solve.shape[0] > 0 else np.zeros(0)
+                return float(residual @ residual + lam2_ * (roughness @ roughness))
 
-        def gradient(x):
-            return 2.0 * (GTG @ x - GTd) + 2.0 * lam2 * (LTL @ x)
+            def gradient(x):
+                return 2.0 * (GTG_ @ x - GTd_) + 2.0 * lam2_ * (LTL_ @ x)
 
-        def hessian(x):
-            return H_const
+            def hessian(x):
+                return H_const_
 
-        moment_constraint = NonlinearConstraint(moment_of, lb=M0_target, ub=M0_target, jac=moment_jac)
+            return objective, gradient, hessian
+
+        def _solve_constrained_once(G_mat, d_vec, x0, maxiter=2000):
+            objective, gradient, hessian = _quadratic_pieces(G_mat, d_vec)
+            moment_constraint_ = NonlinearConstraint(moment_of, lb=M0_target, ub=M0_target, jac=moment_jac)
+            res = minimize(
+                objective, x0, jac=gradient, hess=hessian, method="trust-constr",
+                constraints=[moment_constraint_], bounds=Bounds(bounds_lo, bounds_hi),
+                options={"maxiter": maxiter, "verbose": 0})
+            return res
 
         mean_slip = M0_target / max(mu * float(np.sum(areas_m2)), 1e-30)
         mean_slip = float(np.clip(mean_slip, 0.01, max_slip))
@@ -838,10 +1055,7 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
         else:
             x0[n_p:] = mean_slip  # start on the "reverse" channel; optimizer is free to move it
 
-        result = minimize(
-            objective, x0, jac=gradient, hess=hessian, method="trust-constr",
-            constraints=[moment_constraint], bounds=Bounds(bounds_lo, bounds_hi),
-            options={"maxiter": 2000, "verbose": 0})
+        result = _solve_constrained_once(G_solve, d, x0, maxiter=2000)
         x = result.x
         n_iter = int(result.nit) if getattr(result, "nit", None) is not None else 0
         solver_message, success = str(result.message), bool(result.success)
@@ -865,17 +1079,64 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
     final_moment = mu * float(np.sum(areas_m2 * np.sqrt(rt_arr**2 + rev_arr**2)))
     final_mw = (2.0 / 3.0) * (math.log10(final_moment) - 9.1) if final_moment > 0 else float("-inf")
 
+    # ---- 5. Optional per-patch uncertainty (see docstring above). ----
+    slip_std_pairs = None
+    uncertainty_method = None
+    n_bootstrap_used = 0
+    if estimate_uncertainty:
+        if target_mw is None:
+            # Closed-form Bayesian linear posterior. G_solve/L_solve
+            # already carry any per-row 1/sigma weighting (step 2), so
+            # this is the standard weighted-least-squares-with-Gaussian-
+            # prior posterior covariance -- no separate noise term.
+            GTG_u = G_solve.T @ G_solve
+            LTL_u = (L_solve.T @ L_solve) if L_solve.shape[0] > 0 else np.zeros((n_unknowns, n_unknowns))
+            precision = GTG_u + (smoothing_factor ** 2) * LTL_u
+            cov_x = np.linalg.pinv(precision)
+            std_x = np.sqrt(np.clip(np.diag(cov_x), 0.0, None))
+            uncertainty_method = "posterior_linear"
+        else:
+            # Nonlinear moment constraint -> no closed form. Residual
+            # bootstrap: resample data rows with replacement, re-solve
+            # the SAME constrained problem each time (warm-started from
+            # the already-found solution `x` for speed/stability), and
+            # take the spread of recovered unknowns across resamples.
+            n_boot = max(1, int(n_bootstrap))
+            n_data_rows = G_solve.shape[0]
+            rng = np.random.default_rng(12345)  # fixed seed: reproducible diagnostics
+            boot_xs = np.zeros((n_boot, n_unknowns))
+            for b in range(n_boot):
+                idx = rng.integers(0, n_data_rows, size=n_data_rows)
+                res_b = _solve_constrained_once(G_solve[idx, :], d[idx], x0=x, maxiter=300)
+                boot_xs[b, :] = res_b.x
+            std_x = np.std(boot_xs, axis=0)
+            uncertainty_method = "bootstrap"
+            n_bootstrap_used = n_boot
+
+        if fixed_rake_deg is not None:
+            std_s = std_x  # length n_p, the single per-patch unknown
+            std_rt = np.abs(coef_rt) * std_s
+            std_rev = np.abs(coef_rev) * std_s
+        else:
+            std_rt = std_x[:n_p]
+            std_rev = std_x[n_p:]
+        slip_std_pairs = [[float(std_rt[p]), float(std_rev[p])] for p in range(n_p)]
+
     return {
         "success": True,
         "solver_success": success,
         "solver_message": solver_message,
         "n_iter": n_iter,
         "slip": [[float(rt_arr[p]), float(rev_arr[p])] for p in range(n_p)],
+        "slip_std": slip_std_pairs,           # None unless estimate_uncertainty
+        "uncertainty_method": uncertainty_method,   # None | "posterior_linear" | "bootstrap"
+        "n_bootstrap_used": n_bootstrap_used,
         "rms_misfit": rms,
         "achieved_mw": final_mw,
         "n_data": int(len(d)),
         "predicted": [float(v) for v in predicted],
         "observed": [float(v) for v in d],
+        "row_weights": [float(w) for w in row_weights],
         "component_labels": [[int(o), c] for o, c in comp_labels],
         # Echoed straight from the input job (already a JSON-serializable
         # float, list of floats, or None -- no reprocessing needed).
