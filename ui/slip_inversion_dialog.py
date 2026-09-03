@@ -371,6 +371,7 @@ class SlipInversionDialog(QDialog):
         self._gnss_points = []
         self._los_points = []
         self._overrides = None  # {row: {(i,j):(rt,rev)}}, set on accept
+        self._std_by_row = None  # {row: {(i,j):(std_rt,std_rev)}} or None -- see check_uncertainty
 
         # Total rupture area (m^2), summed over every fault segment's
         # OWN (un-subdivided) geometry -- this is what bounds the
@@ -510,6 +511,31 @@ class SlipInversionDialog(QDialog):
             params_form.addRow(QLabel(
                 "<i>Fixed rake applies the SAME value to every patch of "
                 "every fault segment in this group.</i>"))
+
+        # ── Sigma / uncertainty options ─────────────────────────────
+        # Both default OFF -- existing behavior (unweighted solve, no
+        # uncertainty output) is unchanged unless the user opts in.
+        self.check_auto_sigma = QCheckBox(
+            "Estimate sigma from residuals (for GNSS/InSAR points with no sigma given)")
+        self.check_auto_sigma.setChecked(False)
+        self.check_auto_sigma.setToolTip(
+            "Per component group (E/N/U/InSAR), iteratively estimates a "
+            "noise level from this inversion's own residual RMS when no "
+            "sigma was supplied for that group at all. Groups with even "
+            "partial explicit sigma are left untouched.")
+        params_form.addRow(self.check_auto_sigma)
+
+        self.check_uncertainty = QCheckBox("Estimate per-patch slip uncertainty (1-sigma)")
+        self.check_uncertainty.setChecked(False)
+        self.check_uncertainty.setToolTip(
+            "Unconstrained (no target Mw): closed-form Bayesian linear "
+            "posterior std, computed from the same matrices as the main "
+            "solve -- no extra cost.\n"
+            "Moment-constrained (target Mw set): residual bootstrap "
+            "resampling instead (no closed form for the nonlinear "
+            "constraint) -- adds solver runs, so this can noticeably "
+            "slow the run.")
+        params_form.addRow(self.check_uncertainty)
 
         # ── Feasibility hint + auto-fill ────────────────────────────
         # max_slip and target_mw trade off against the FIXED total
@@ -716,12 +742,14 @@ class SlipInversionDialog(QDialog):
             specs = [{"key": s["row"], "fault": s["fault"],
                      "n_length": s["n_length"], "n_width": s["n_width"]}
                     for s in self._fault_specs]
-            overrides_by_row, diag = run_slip_inversion_group(
+            overrides_by_row, diag, std_by_row = run_slip_inversion_group(
                 specs, self._gnss_points, self._los_points, self._elastic,
                 smoothing_factor=float(self.spin_smoothing.value()),
                 max_slip=float(self.spin_max_slip.value()),
                 target_mw=target_mw, fixed_rake_deg=fixed_rake_deg,
-                timeout_s=int(self.spin_timeout_min.value()) * 60)
+                timeout_s=int(self.spin_timeout_min.value()) * 60,
+                auto_sigma=self.check_auto_sigma.isChecked(),
+                estimate_uncertainty=self.check_uncertainty.isChecked())
         except Exception as e:
             self.result_label.setText("")
             QMessageBox.critical(self, "Inversion failed", str(e))
@@ -731,6 +759,7 @@ class SlipInversionDialog(QDialog):
             self.btn_run.setEnabled(True)
 
         self._overrides = overrides_by_row
+        self._std_by_row = std_by_row
         self.btn_apply.setEnabled(True)
         # Snapshot the exact points/diagnostics THIS run used, so later
         # exports stay consistent even if more points are imported into
@@ -753,10 +782,27 @@ class SlipInversionDialog(QDialog):
                    f" (target {target_mw:.3f})" if target_mw is not None
                    else f" | achieved Mw {diag['achieved_mw']:.3f}")
         rake_line = (f" | fixed rake {fixed_rake_deg:.1f}°" if fixed_rake_deg is not None else "")
+
+        sigma_line = ""
+        estimated_sigma = diag.get("estimated_sigma") or {}
+        if estimated_sigma:
+            parts = ", ".join(f"{k}={v:.4g}" for k, v in estimated_sigma.items())
+            sigma_line = f"<br>Auto-estimated sigma: {parts}"
+
+        uncertainty_line = ""
+        method = diag.get("uncertainty_method")
+        if method == "posterior_linear":
+            uncertainty_line = "<br>Uncertainty: closed-form Bayesian linear posterior std."
+        elif method == "bootstrap":
+            uncertainty_line = (
+                f"<br>Uncertainty: residual bootstrap "
+                f"({diag.get('n_bootstrap_used', 0)} resamples) -- "
+                f"no closed form for the moment-constrained solve.")
+
         self.result_label.setText(
             f"Solver {status}: {diag.get('solver_message', '')}<br>"
             f"n_data={diag.get('n_data')}  RMS misfit={diag.get('rms_misfit'):.4g}"
-            f"{mw_line}{rake_line}")
+            f"{mw_line}{rake_line}{sigma_line}{uncertainty_line}")
 
         self.result_table.setRowCount(0)
         row_out = 0
@@ -829,7 +875,8 @@ class SlipInversionDialog(QDialog):
             return
         fault_segments = [
             {"name": s["name"], "n_length": s["n_length"], "n_width": s["n_width"],
-             "overrides": self._overrides[s["row"]]}
+             "overrides": self._overrides[s["row"]],
+             "std_overrides": (self._std_by_row.get(s["row"]) if self._std_by_row else None)}
             for s in self._fault_specs
         ]
         text = build_slip_inversion_report(
