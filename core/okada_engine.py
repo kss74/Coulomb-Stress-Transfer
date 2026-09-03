@@ -1442,7 +1442,9 @@ def _run_dc3d_worker_displacement(sources, elastic, grid, z_recv_km):
 def _run_dc3d_worker_slip_inversion(patches, n_length, n_width, observations,
                                     los_observations, elastic,
                                     smoothing_factor, max_slip, target_mw,
-                                    fixed_rake_deg=None, timeout_s=3600):
+                                    fixed_rake_deg=None, timeout_s=3600,
+                                    auto_sigma=False, estimate_uncertainty=False,
+                                    n_bootstrap=20):
     """
     Run the external DC3D worker script in "slip_inversion" mode.
 
@@ -1474,6 +1476,21 @@ def _run_dc3d_worker_slip_inversion(patches, n_length, n_width, observations,
                         is the cheaper first lever; raise this only once
                         that's already been tried and the job is still
                         genuinely this large.
+    auto_sigma        : bool, default False. Per whole component group
+                        (e/n/u/los), estimate sigma from the inversion's
+                        own residual RMS (2-3 solve iterations) for any
+                        group where the caller supplied NO sigma at all
+                        for a single point in it. See dc3d_worker.py's
+                        _solve_with_auto_sigma() docstring.
+    estimate_uncertainty : bool, default False. Adds per-patch 1-sigma
+                        slip uncertainty to the payload ("slip_std") --
+                        closed-form Bayesian linear posterior when
+                        target_mw is None, residual bootstrap otherwise.
+                        See dc3d_worker.py's _solve_slip_inversion()
+                        docstring for the full method description.
+    n_bootstrap       : int, default 20. Only used for the bootstrap
+                        fallback (target_mw set AND estimate_uncertainty
+                        True); ignored otherwise.
 
     Returns the raw worker payload dict (see dc3d_worker.py module
     docstring "slip_inversion" output schema), or raises RuntimeError
@@ -1495,6 +1512,9 @@ def _run_dc3d_worker_slip_inversion(patches, n_length, n_width, observations,
         "max_slip": max_slip,
         "target_mw": target_mw,
         "fixed_rake_deg": fixed_rake_deg,
+        "auto_sigma": auto_sigma,
+        "estimate_uncertainty": estimate_uncertainty,
+        "n_bootstrap": n_bootstrap,
     }
 
     worker_script = os.path.abspath(_dc3d_worker_script_path())
@@ -1528,7 +1548,8 @@ def _run_dc3d_worker_slip_inversion(patches, n_length, n_width, observations,
 def run_slip_inversion(parent_fault, n_length, n_width, observations,
                        los_observations, elastic, smoothing_factor=0.05,
                        max_slip=10.0, target_mw=None, fixed_rake_deg=None,
-                       timeout_s=3600):
+                       timeout_s=3600, auto_sigma=False,
+                       estimate_uncertainty=False, n_bootstrap=20):
     """
     High-level driver: subdivide parent_fault (geometry only -- its own
     uniform slip is ignored) and invert scattered surface-displacement
@@ -1554,38 +1575,58 @@ def run_slip_inversion(parent_fault, n_length, n_width, observations,
                    geologic slip vector on this fault), and directly
                    improves conditioning for otherwise under-determined
                    geometries (vertical-only GNSS, single-track InSAR).
+    auto_sigma,
+    estimate_uncertainty,
+    n_bootstrap  : see _run_dc3d_worker_slip_inversion() above. Both
+                   default to off, so existing callers are unaffected.
 
-    Returns (overrides, diagnostics):
+    Returns (overrides, diagnostics, std_overrides):
       overrides    : {(i, j): (rt_lateral_slip, reverse_slip)} dict,
                      ready for FaultTableWidget._set_distributed_slip()
                      -- always this shape, even when fixed_rake_deg was
                      used (each pair then lies exactly on that rake).
       diagnostics  : the raw worker payload (rms_misfit, achieved_mw,
                      solver_success, solver_message, n_data, predicted,
-                     observed, component_labels, fixed_rake_deg) for
+                     observed, component_labels, fixed_rake_deg,
+                     slip_std, uncertainty_method, n_bootstrap_used,
+                     estimated_sigma, sigma_iteration_history) for
                      display/QA.
+      std_overrides : {(i, j): (std_rt_lateral, std_reverse)} dict, same
+                     shape as overrides, or None when estimate_uncertainty
+                     was False. Kept as a SEPARATE dict rather than folded
+                     into overrides so existing callers of overrides that
+                     feed straight into _set_distributed_slip() (which
+                     expects exactly a (rt, reverse) 2-tuple) are
+                     unaffected.
     """
     patches = parent_fault.subdivide(n_length, n_width)  # geometry only
     payload = _run_dc3d_worker_slip_inversion(
         patches, n_length, n_width, observations, los_observations,
         elastic, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
-        timeout_s=timeout_s)
+        timeout_s=timeout_s, auto_sigma=auto_sigma,
+        estimate_uncertainty=estimate_uncertainty, n_bootstrap=n_bootstrap)
 
     overrides = {}
+    std_overrides = {} if payload.get("slip_std") else None
     flat = 0
     for i in range(n_width):
         for j in range(n_length):
             rt, rev = payload["slip"][flat]
             overrides[(i, j)] = (rt, rev)
+            if std_overrides is not None:
+                std_rt, std_rev = payload["slip_std"][flat]
+                std_overrides[(i, j)] = (std_rt, std_rev)
             flat += 1
 
-    return overrides, payload
+    return overrides, payload, std_overrides
 
 
 def _run_dc3d_worker_slip_inversion_group(fault_segments, observations,
                                           los_observations, elastic,
                                           smoothing_factor, max_slip, target_mw,
-                                          fixed_rake_deg=None, timeout_s=3600):
+                                          fixed_rake_deg=None, timeout_s=3600,
+                                          auto_sigma=False, estimate_uncertainty=False,
+                                          n_bootstrap=20):
     """
     Multi-fault-segment counterpart of _run_dc3d_worker_slip_inversion()
     -- see dc3d_worker.py's "slip_inversion_group" mode docstring for
@@ -1623,6 +1664,9 @@ def _run_dc3d_worker_slip_inversion_group(fault_segments, observations,
         "max_slip": max_slip,
         "target_mw": target_mw,
         "fixed_rake_deg": fixed_rake_deg,
+        "auto_sigma": auto_sigma,
+        "estimate_uncertainty": estimate_uncertainty,
+        "n_bootstrap": n_bootstrap,
     }
 
     worker_script = os.path.abspath(_dc3d_worker_script_path())
@@ -1656,7 +1700,8 @@ def _run_dc3d_worker_slip_inversion_group(fault_segments, observations,
 def run_slip_inversion_group(fault_specs, observations, los_observations,
                              elastic, smoothing_factor=0.05, max_slip=10.0,
                              target_mw=None, fixed_rake_deg=None,
-                             timeout_s=3600):
+                             timeout_s=3600, auto_sigma=False,
+                             estimate_uncertainty=False, n_bootstrap=20):
     """
     Multi-fault ("Group") counterpart of run_slip_inversion(): jointly
     inverts the SAME observations against several fault rows at once
@@ -1687,8 +1732,15 @@ def run_slip_inversion_group(fault_specs, observations, los_observations,
                    every segment's patches into one Green's matrix, so
                    this is at least as slow as an equivalent single-
                    fault job with the same total patch count.
+    auto_sigma,
+    estimate_uncertainty,
+    n_bootstrap    : same meaning as run_slip_inversion(), applied to
+                   the WHOLE joint solve (one shared sigma per component
+                   group across every fault in the group, one shared
+                   uncertainty computation over the concatenated
+                   unknowns). Both uncertainty options default to off.
 
-    Returns (overrides_by_key, diagnostics):
+    Returns (overrides_by_key, diagnostics, std_overrides_by_key):
       overrides_by_key : {key: {(i, j): (rt_lateral_slip, reverse_slip)}}
                          -- one entry per fault_specs["key"], ready for
                          FaultTableWidget._set_distributed_slip() per row.
@@ -1697,6 +1749,10 @@ def run_slip_inversion_group(fault_specs, observations, los_observations,
                           "segment_patch_counts") for display/QA --
                           rms_misfit/achieved_mw/predicted/observed are
                           for the WHOLE joint solve, not per-fault.
+      std_overrides_by_key : same shape as overrides_by_key, or None
+                          when estimate_uncertainty was False -- kept
+                          separate for the same reason as
+                          run_slip_inversion()'s std_overrides.
     """
     fault_segments = []
     for spec in fault_specs:
@@ -1709,21 +1765,30 @@ def run_slip_inversion_group(fault_specs, observations, los_observations,
     payload = _run_dc3d_worker_slip_inversion_group(
         fault_segments, observations, los_observations,
         elastic, smoothing_factor, max_slip, target_mw, fixed_rake_deg,
-        timeout_s=timeout_s)
+        timeout_s=timeout_s, auto_sigma=auto_sigma,
+        estimate_uncertainty=estimate_uncertainty, n_bootstrap=n_bootstrap)
 
+    has_std = bool(payload.get("slip_std"))
     overrides_by_key = {}
+    std_overrides_by_key = {} if has_std else None
     flat = 0
     for spec, seg in zip(fault_specs, fault_segments):
         n_length, n_width = spec["n_length"], spec["n_width"]
         overrides = {}
+        std_overrides = {} if has_std else None
         for i in range(n_width):
             for j in range(n_length):
                 rt, rev = payload["slip"][flat]
                 overrides[(i, j)] = (rt, rev)
+                if has_std:
+                    std_rt, std_rev = payload["slip_std"][flat]
+                    std_overrides[(i, j)] = (std_rt, std_rev)
                 flat += 1
         overrides_by_key[spec["key"]] = overrides
+        if has_std:
+            std_overrides_by_key[spec["key"]] = std_overrides
 
-    return overrides_by_key, payload
+    return overrides_by_key, payload, std_overrides_by_key
 
 
 # ─── High-level grid drivers ─────────────────────────────────────────────────

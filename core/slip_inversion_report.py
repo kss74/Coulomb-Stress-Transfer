@@ -91,6 +91,19 @@ def build_slip_inversion_report(fault_segments, elastic,
     lines.append(f"  n_data       : {diag.get('n_data')}")
     lines.append(f"  rms_misfit   : {diag.get('rms_misfit'):.6g}")
     lines.append(f"  achieved_mw  : {diag.get('achieved_mw'):.4f}")
+    estimated_sigma = diag.get("estimated_sigma") or {}
+    if estimated_sigma:
+        sigma_str = ", ".join(f"{k}={v:.4g}" for k, v in estimated_sigma.items())
+        lines.append(f"  auto sigma   : {sigma_str} (estimated from residual RMS; "
+                     f"see sigma_iteration_history for convergence)")
+    method = diag.get("uncertainty_method")
+    if method == "posterior_linear":
+        lines.append("  uncertainty  : closed-form Bayesian linear posterior std "
+                     "(see 'std_rt_m'/'std_rev_m' columns below)")
+    elif method == "bootstrap":
+        lines.append(f"  uncertainty  : residual bootstrap, "
+                     f"{diag.get('n_bootstrap_used', 0)} resamples (no closed form "
+                     f"for the moment-constrained solve; see std columns below)")
     lines.append("")
     lines.append("Per-observation fit (residual = predicted - observed)")
     lines.append("-" * 64)
@@ -107,12 +120,18 @@ def build_slip_inversion_report(fault_segments, elastic,
 
     for seg in fault_segments:
         n_length, n_width, overrides = seg["n_length"], seg["n_width"], seg["overrides"]
+        std_overrides = seg.get("std_overrides")  # optional; None if uncertainty wasn't estimated
         lines.append("")
         lines.append(f"Per-patch slip result -- {seg['name']} "
                      f"(Coulomb convention: U1=-rt_lateral, U2=reverse)")
         lines.append("-" * 64)
-        lines.append(f"{'patch':>6} {'i':>3} {'j':>3} {'rt_lateral_m':>13} "
-                     f"{'reverse_m':>11} {'magnitude_m':>12} {'rake_deg':>9}")
+        if std_overrides is not None:
+            lines.append(f"{'patch':>6} {'i':>3} {'j':>3} {'rt_lateral_m':>13} "
+                         f"{'reverse_m':>11} {'magnitude_m':>12} {'rake_deg':>9} "
+                         f"{'std_rt_m':>10} {'std_rev_m':>10}")
+        else:
+            lines.append(f"{'patch':>6} {'i':>3} {'j':>3} {'rt_lateral_m':>13} "
+                         f"{'reverse_m':>11} {'magnitude_m':>12} {'rake_deg':>9}")
         patch_labels = _annex_labels(n_length * n_width)
         flat = 0
         for i in range(n_width):
@@ -120,8 +139,14 @@ def build_slip_inversion_report(fault_segments, elastic,
                 rt, rev = overrides[(i, j)]
                 mag = math.hypot(rt, rev)
                 rake = math.degrees(math.atan2(rev, -rt)) if mag > 0 else 0.0
-                lines.append(f"{patch_labels[flat]:>6} {i:>3} {j:>3} {rt:>13.5g} "
-                             f"{rev:>11.5g} {mag:>12.5g} {rake:>9.2f}")
+                if std_overrides is not None:
+                    std_rt, std_rev = std_overrides[(i, j)]
+                    lines.append(f"{patch_labels[flat]:>6} {i:>3} {j:>3} {rt:>13.5g} "
+                                 f"{rev:>11.5g} {mag:>12.5g} {rake:>9.2f} "
+                                 f"{std_rt:>10.3g} {std_rev:>10.3g}")
+                else:
+                    lines.append(f"{patch_labels[flat]:>6} {i:>3} {j:>3} {rt:>13.5g} "
+                                 f"{rev:>11.5g} {mag:>12.5g} {rake:>9.2f}")
                 flat += 1
 
     return "\n".join(lines) + "\n"
