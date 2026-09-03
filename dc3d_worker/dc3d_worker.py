@@ -900,6 +900,32 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
     G = np.array(G_rows)   # (n_data, 2*n_p)
     d = np.array(d_rows)
 
+    # ---- 2b. Sigma-aware smoothing. ----
+    #      smoothing_factor is tuned/interpreted against UNWEIGHTED data
+    #      rows (weight=1, i.e. an implicit sigma of 1 physical unit).
+    #      When per-row 1/sigma weights are applied above (explicit user
+    #      sigma OR auto_sigma), the data rows are scaled by
+    #      `weight`, but the smoothing block below is not -- so the
+    #      *relative* strength of the roughness penalty against the data
+    #      term silently collapses (or inflates) by whatever the typical
+    #      weight is. This is invisible when weight~1 (the common case
+    #      this project has been validated against so far), which is
+    #      why it wasn't caught until auto_sigma made weight far from 1.
+    #      Fix: rescale smoothing_factor by the geometric mean of the
+    #      weights actually applied to G/d, so the ratio of data-term to
+    #      smoothing-term strength stays anchored to whatever
+    #      smoothing_factor was tuned to mean in the unweighted case.
+    #      Geometric mean (not arithmetic) is used because weights are
+    #      strictly positive and multiplicative in nature (1/sigma); it
+    #      is also insensitive to the *count* of rows in each group,
+    #      only their typical scale. When every weight is 1.0 (no
+    #      explicit sigma, no auto_sigma) this reduces to exactly 1.0,
+    #      so smoothing_eff == smoothing_factor -- BIT-IDENTICAL to
+    #      pre-existing validated behavior for every already-tested
+    #      case.
+    weight_scale = float(np.exp(np.mean(np.log(np.asarray(row_weights, dtype=float)))))
+    smoothing_eff = smoothing_factor * weight_scale
+
     # ---- 3. Patch areas (m^2), needed only for the moment constraint ----
     areas_m2 = np.array([p["length"] * 1000.0 * p["width"] * 1000.0 for p in patches])
 
@@ -949,7 +975,7 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
         #      linear least-squares system, bounds enforced directly.
         from scipy.optimize import lsq_linear
         if L_solve.shape[0] > 0:
-            A = np.vstack([G_solve, smoothing_factor * L_solve])
+            A = np.vstack([G_solve, smoothing_eff * L_solve])
             b = np.concatenate([d, np.zeros(L_solve.shape[0])])
         else:
             A, b = G_solve, d
@@ -1022,7 +1048,7 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
             # resamples -- L_solve/smoothing_factor/n_unknowns do not).
             GTG_, GTd_ = G_mat.T @ G_mat, G_mat.T @ d_vec
             LTL_ = (L_solve.T @ L_solve) if L_solve.shape[0] > 0 else np.zeros((n_unknowns, n_unknowns))
-            lam2_ = smoothing_factor**2
+            lam2_ = smoothing_eff**2
             H_const_ = 2.0 * (GTG_ + lam2_ * LTL_)
 
             def objective(x):
@@ -1091,7 +1117,7 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
             # prior posterior covariance -- no separate noise term.
             GTG_u = G_solve.T @ G_solve
             LTL_u = (L_solve.T @ L_solve) if L_solve.shape[0] > 0 else np.zeros((n_unknowns, n_unknowns))
-            precision = GTG_u + (smoothing_factor ** 2) * LTL_u
+            precision = GTG_u + (smoothing_eff ** 2) * LTL_u
             cov_x = np.linalg.pinv(precision)
             std_x = np.sqrt(np.clip(np.diag(cov_x), 0.0, None))
             uncertainty_method = "posterior_linear"
@@ -1137,6 +1163,9 @@ def _solve_slip_inversion(dc3dwrapper, np, patches, L_base, observations,
         "predicted": [float(v) for v in predicted],
         "observed": [float(v) for v in d],
         "row_weights": [float(w) for w in row_weights],
+        "smoothing_factor_input": float(smoothing_factor),
+        "smoothing_weight_scale": weight_scale,
+        "smoothing_factor_effective": float(smoothing_eff),
         "component_labels": [[int(o), c] for o, c in comp_labels],
         # Echoed straight from the input job (already a JSON-serializable
         # float, list of floats, or None -- no reprocessing needed).
