@@ -28,7 +28,9 @@ without switching tools.
 > before you rely on it, and please open an issue if something looks
 > off. If you want to add more features or debug the plugin, you can
 > ask Claude for help. Just upload the plugin files to a Claude Project
-> or provide the GitHub repository link.
+> or provide the GitHub repository link. You can also ask Claude (or any
+> AI) for help during installation and explanation/tutorials on this plugin's
+> features.
 
 ---
 
@@ -134,7 +136,8 @@ compiled extensions in-place, the plugin can instead be pointed at any
 external Python interpreter (e.g. a conda/venv environment) that already
 has `okada-wrapper` installed; it is invoked via subprocess for
 depth-dependent calculations. Configure this under **Check / Install
-Dependencies…**.
+Dependencies…**. If you encounter difficulties during installation, ask Claude
+(or any AI) for help.
 
 ---
 
